@@ -42,6 +42,9 @@ namespace MBSyncToServiceUI
         private readonly string windowSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MusicBeeSyncToService", "WindowSettings.txt");
         private bool suppressWindowSizeSave = true;
         private const double DefaultLogPanelWidth = 360;
+        private readonly object recentLogLinesLock = new object();
+        private readonly Queue<string> recentLogLines = new Queue<string>();
+        private const int MaxRecentLogLines = 500;
 
         public ObservableCollection<CheckedListItem<MusicBeePlaylist>> MusicBeePlaylists { get; set; }
         public ObservableCollection<CheckedListItem<SpotifyPlaylist>> SpotifyPlaylists { get; set; }
@@ -73,6 +76,7 @@ namespace MBSyncToServiceUI
 
             Action<string> log = (s) => Dispatcher.Invoke(() => { Log(s); });
             Spotify = new SpotifySyncHelper(log, MusicBee);
+            CrashReportLogger.Initialize(GetRecentLogLinesSnapshot, GetDiagnosticStateSnapshot, Dispatcher);
 
             SongConferenceListBox.ItemsSource = Spotify.PopulatedSongs;
             SongConferenceListBox.SetBinding(ListBox.SelectedItemProperty, new Binding("PopulatedSongSelected") { Source = this, Mode = BindingMode.TwoWay });
@@ -91,6 +95,123 @@ namespace MBSyncToServiceUI
             suppressWindowSizeSave = false;
         }
 
+
+        private void ReportHandledException(Exception ex, string context, IDictionary<string, string> additionalData = null)
+        {
+            string reportPath = string.Empty;
+
+            try
+            {
+                reportPath = CrashReportLogger.WriteExceptionReport(ex, context, additionalData);
+            }
+            catch
+            {
+            }
+
+            Log($"{context}: {ex.Message}");
+
+            if (!string.IsNullOrWhiteSpace(reportPath))
+            {
+                Log($"Detailed crash report saved to: {reportPath}");
+            }
+        }
+
+        private IEnumerable<string> GetRecentLogLinesSnapshot()
+        {
+            lock (recentLogLinesLock)
+            {
+                return recentLogLines.ToList();
+            }
+        }
+
+        private IDictionary<string, string> GetDiagnosticStateSnapshot()
+        {
+            if (!Dispatcher.CheckAccess())
+            {
+                return Dispatcher.Invoke(() => GetDiagnosticStateSnapshotCore());
+            }
+
+            return GetDiagnosticStateSnapshotCore();
+        }
+
+        private IDictionary<string, string> GetDiagnosticStateSnapshotCore()
+        {
+            var state = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var selectedMbPlaylists = GetMusicBeePlaylistsToSync();
+            var selectedSpotifyPlaylists = GetSpotifyPlaylistsToSync();
+
+            state["WindowTitle"] = Title ?? string.Empty;
+            state["WindowIsLoaded"] = IsLoaded.ToString();
+            state["WindowVisibility"] = Visibility.ToString();
+            state["WindowWidth"] = Width.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            state["WindowHeight"] = Height.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            state["WindowLeft"] = Left.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            state["WindowTop"] = Top.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            state["WindowState"] = WindowState.ToString();
+            state["SyncDirection"] = SyncToService ? "MusicBee -> Spotify" : "Spotify -> MusicBee";
+            state["IncludeFoldersInPlaylistName"] = IncludeFolders.ToString();
+            state["IncludeZPrefixForDatePlaylists"] = IncludeZ.ToString();
+            state["AutoLoginAttempted"] = autoLoginAttempted.ToString();
+            state["MusicBeeLoadedPlaylistCount"] = (MusicBee?.Playlists?.Count ?? 0).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            state["MusicBeeLoadedSongCount"] = (MusicBee?.Songs?.Count ?? 0).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            state["SpotifyListBoxItemCount"] = SpotifyPlaylists.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            state["MusicBeeListBoxItemCount"] = MusicBeePlaylists.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            state["SelectedMusicBeePlaylistCount"] = selectedMbPlaylists.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            state["SelectedSpotifyPlaylistCount"] = selectedSpotifyPlaylists.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            state["SelectedMusicBeePlaylists"] = string.Join(" | ", selectedMbPlaylists.Select(p => p?.Name).Where(n => !string.IsNullOrWhiteSpace(n)).Take(20));
+            state["SelectedSpotifyPlaylists"] = string.Join(" | ", selectedSpotifyPlaylists.Select(p => p?.Name).Where(n => !string.IsNullOrWhiteSpace(n)).Take(20));
+            state["SongSearchBoxText"] = SongSearchBox != null ? SongSearchBox.Text ?? string.Empty : string.Empty;
+            state["SongConferenceSelectedMusicBeeSong"] = PopulatedSongSelected?.MbSongDisplayName ?? string.Empty;
+            state["SongConferenceSelectedSpotifySong"] = PopulatedSongSelected?.SpotifySongDisplayName ?? string.Empty;
+            state["OutputParagraphCount"] = ((OutputTextBox != null && OutputTextBox.Document != null) ? OutputTextBox.Document.Blocks.Count : 0).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            state["FirstSectionPanelVisibility"] = FirstSectionPanel.Visibility.ToString();
+            state["SecondSectionPanelVisibility"] = SecondSectionPanel.Visibility.ToString();
+            state["BtnContinueSyncEnabled"] = BtnContinueSync.IsEnabled.ToString();
+            state["SpotifySyncButtonEnabled"] = SpotifySyncButton.IsEnabled.ToString();
+            state["SpotifyLoginButtonEnabled"] = SpotifyLoginButton.IsEnabled.ToString();
+            state["SpotifyLoginButtonContent"] = SpotifyLoginButton.Content != null ? SpotifyLoginButton.Content.ToString() : string.Empty;
+            state["SpotifySearchHintVisibility"] = SpotifySearchHint.Visibility.ToString();
+            state["WindowSettingsPath"] = windowSettingsPath;
+            state["CrashReportDirectory"] = CrashReportLogger.GetCrashReportDirectory();
+            state["FailureLogPath"] = Spotify != null ? Spotify.GetFailureLogPath() : string.Empty;
+
+            if (Content is Grid grid && grid.ColumnDefinitions.Count > 0)
+            {
+                double logPanelWidth = grid.ColumnDefinitions[0].ActualWidth > 0
+                    ? grid.ColumnDefinitions[0].ActualWidth
+                    : grid.ColumnDefinitions[0].Width.Value;
+
+                state["LogPanelWidth"] = logPanelWidth.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+
+            if (Spotify != null)
+            {
+                foreach (var item in Spotify.GetDiagnosticSnapshot())
+                {
+                    state[item.Key] = item.Value ?? string.Empty;
+                }
+            }
+
+            return state;
+        }
+
+        private void RememberLogLine(string line)
+        {
+            var normalizedLines = (line ?? string.Empty).Replace("\r\n", "\n").Split(new[] { '\n' }, StringSplitOptions.None);
+
+            lock (recentLogLinesLock)
+            {
+                foreach (var part in normalizedLines)
+                {
+                    if (recentLogLines.Count >= MaxRecentLogLines)
+                    {
+                        recentLogLines.Dequeue();
+                    }
+
+                    recentLogLines.Enqueue($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} | {part ?? string.Empty}");
+                }
+            }
+        }
 
         private void LoadWindowSettings()
         {
@@ -289,7 +410,10 @@ namespace MBSyncToServiceUI
             }
             catch (Exception ex)
             {
-                Log($"Error when trying to login to Spotify: {ex.Message}");
+                ReportHandledException(ex, "Spotify login failed", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Operation"] = "SpotifyLoginButton_ClickAsync"
+                });
             }
 
             if (success)
@@ -299,7 +423,21 @@ namespace MBSyncToServiceUI
                 Log("Fetching Spotify Playlists...");
                 SpotifySelectAllButton.IsEnabled = true;
                 SpotifySyncButton.IsEnabled = true;
-                await RefreshSpotifyPlaylists();
+
+                try
+                {
+                    await RefreshSpotifyPlaylists();
+                }
+                catch (Exception ex)
+                {
+                    ReportHandledException(ex, "Spotify playlist refresh failed after login", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["Operation"] = "SpotifyLoginButton_ClickAsync.RefreshSpotifyPlaylists"
+                    });
+
+                    Log("Spotify login succeeded, but loading playlists failed. Please re-open the app and try again.");
+                    SpotifyLoginButton.IsEnabled = true;
+                }
             }
             else
             {
@@ -424,7 +562,10 @@ namespace MBSyncToServiceUI
             }
             catch (Exception ex)
             {
-                Log(ex.Message);
+                ReportHandledException(ex, "Populate Spotify playlist into MusicBee failed", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Operation"] = "SpotifyToMbPopulateSongsOfSelectedPlaylist"
+                });
             }
         }
 
@@ -443,7 +584,10 @@ namespace MBSyncToServiceUI
             }
             catch (Exception ex)
             {
-                Log(ex.Message);
+                ReportHandledException(ex, "Save populated Spotify playlist into MusicBee failed", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Operation"] = "SpotifyToMbSavePopulatedList"
+                });
             }
         }
 
@@ -468,7 +612,10 @@ namespace MBSyncToServiceUI
             }
             catch (Exception ex)
             {
-                Log(ex.Message);
+                ReportHandledException(ex, "Save MusicBee playlist into Spotify failed", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Operation"] = "MbToSpotifySavePopulatedList"
+                });
             }
         }
 
@@ -504,7 +651,10 @@ namespace MBSyncToServiceUI
             }
             catch (Exception ex)
             {
-                Log(ex.Message);
+                ReportHandledException(ex, "Populate MusicBee playlist into Spotify failed", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Operation"] = "MbToSpotifyPopulateSongsOfSelectedPlaylist"
+                });
             }
         }
 
@@ -539,7 +689,11 @@ namespace MBSyncToServiceUI
             }
             catch (Exception ex)
             {
-                Log(ex.Message);
+                ReportHandledException(ex, "Bulk playlist sync failed", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Operation"] = "SpotifySyncMultiplePlaylists",
+                    ["BulkSyncDirection"] = direction
+                });
             }
         }
 
@@ -559,10 +713,25 @@ namespace MBSyncToServiceUI
         private async Task RefreshSpotifyPlaylists()
         {
             List<SimplePlaylist> spotifyPlaylists = await Spotify.RefreshPlaylists();
-            spotifyPlaylists = spotifyPlaylists.OrderBy(p => p.Name).ToList();
+
+            var orderedPlaylists = spotifyPlaylists
+                .Where(p => p != null)
+                .OrderBy(p => Spotify.IsPlaylistOwnedByCurrentUser(p) ? 0 : (p.Collaborative ? 1 : 2))
+                .ThenBy(p => string.IsNullOrWhiteSpace(p.Name) ? 1 : 0)
+                .ToList();
+
             SpotifyPlaylists.Clear();
-            spotifyPlaylists.ForEach(x => SpotifyPlaylists.Add(new CheckedListItem<SpotifyPlaylist>(new SpotifyPlaylist(x))));
+            orderedPlaylists.ForEach(x =>
+                SpotifyPlaylists.Add(
+                    new CheckedListItem<SpotifyPlaylist>(
+                        new SpotifyPlaylist(x, Spotify.CanReadPlaylistItems(x), Spotify.GetPlaylistAccessLabel(x)))));
             SpotifyPlaylistListBox.ItemsSource = SpotifyPlaylists;
+
+            int readOnlyCount = orderedPlaylists.Count(p => !Spotify.CanReadPlaylistItems(p));
+            if (readOnlyCount > 0)
+            {
+                Log($"Spotify returned {readOnlyCount} followed/read-only playlists. Spotify blocks this plugin from reading their items unless you own them or are a collaborator, so they are shown at the bottom.");
+            }
         }
 
         private void SpotifySelectAllButton_Checked(object sender, RoutedEventArgs e)
@@ -582,6 +751,8 @@ namespace MBSyncToServiceUI
 
         public void Log(string line)
         {
+            RememberLogLine(line);
+
             if (OutputTextBox.Document == null)
             {
                 OutputTextBox.Document = new FlowDocument();
@@ -721,9 +892,12 @@ namespace MBSyncToServiceUI
 
                 LibrarySearchResultsSelected = LibrarySearchResults.FirstOrDefault();
             }
-            catch 
+            catch (Exception ex)
             {
-                Log("Something goes wrong at search.");
+                ReportHandledException(ex, "MusicBee library search failed", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Operation"] = "SearchOnLibrary"
+                });
             }
             finally
             {
@@ -900,9 +1074,12 @@ namespace MBSyncToServiceUI
 
                 SpotifySongSearchResultsSelected = SpotifySongSearchResults.FirstOrDefault();
             }
-            catch
+            catch (Exception ex)
             {
-                Log("Something goes wrong at search.");
+                ReportHandledException(ex, "Spotify search failed", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Operation"] = "SearchOnSpotify"
+                });
             }
             finally
             {

@@ -148,9 +148,9 @@ namespace MusicBeePlugin.Services
                 .Select(s =>
                 {
                     int score = 0;
-                    var title = s.Title.ToLower();
-                    var artist = s.Artist.ToLower();
-                    var album = s.Album.ToLower();
+                    var title = (s.Title ?? string.Empty).ToLowerInvariant();
+                    var artist = (s.Artist ?? string.Empty).ToLowerInvariant();
+                    var album = (s.Album ?? string.Empty).ToLowerInvariant();
 
                     foreach (var word in words)
                     {

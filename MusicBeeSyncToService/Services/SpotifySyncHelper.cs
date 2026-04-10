@@ -2,6 +2,9 @@
 using SpotifyAPI.Web;
 using SpotifyAPI.Web.Auth;
 using SpotifyAPI.Web.Http;
+using Newtonsoft.Json.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System;
 using System.Net;
 using System.Collections.Generic;
@@ -22,6 +25,7 @@ namespace MusicBeePlugin.Services
         private PrivateUser Profile;
         private SpotifyClient Spotify;
         private Action<string> Log;
+        private string spotifyAccessToken;
                 private MusicBeeSyncHelper musicBeeSyncHelper;
         private readonly string failureLogPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MusicBeeSyncToService", "LoggedFailures.txt");
         private const string FailureLogSeparator = "\t|\t";
@@ -29,9 +33,49 @@ namespace MusicBeePlugin.Services
         public List<SimplePlaylist> Playlists { get; set; } = new List<SimplePlaylist>();
         public SyncRunReport LastRunReport { get; private set; } = new SyncRunReport();
 
+        private sealed class PlaylistReadResult
+        {
+            public List<FullTrack> Tracks { get; } = new List<FullTrack>();
+            public int? Total { get; set; }
+            public bool UsedPlaylistDetailsEndpoint { get; set; }
+            public bool UsedPlaylistItemsEndpoint { get; set; }
+            public bool ItemsEndpointForbidden { get; set; }
+            public bool DetailsEndpointForbidden { get; set; }
+            public bool DetailsHadEmbeddedItems { get; set; }
+            public bool IsPartial { get; set; }
+            public string FailureReason { get; set; } = string.Empty;
+        }
+
+
         public string GetFailureLogPath()
         {
             return failureLogPath;
+        }
+
+        public IDictionary<string, string> GetDiagnosticSnapshot()
+        {
+            var populatedSongs = PopulatedSongs ?? new List<PopulatedSong>();
+            var playlists = Playlists ?? new List<SimplePlaylist>();
+            var report = LastRunReport ?? new SyncRunReport();
+
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["SpotifyHelper_IsLoggedIn"] = (Spotify != null).ToString(),
+                ["SpotifyHelper_ProfileId"] = Profile?.Id ?? string.Empty,
+                ["SpotifyHelper_ProfileDisplayName"] = Profile?.DisplayName ?? string.Empty,
+                ["SpotifyHelper_LoadedPlaylistCount"] = playlists.Count.ToString(CultureInfo.InvariantCulture),
+                ["SpotifyHelper_LoadedPlaylistPreview"] = string.Join(" | ", playlists.Where(p => !string.IsNullOrWhiteSpace(p?.Name)).Take(20).Select(p => p.Name)),
+                ["SpotifyHelper_PopulateMusicBeePlaylist"] = PopulateMusicBeePlaylist?.Name ?? string.Empty,
+                ["SpotifyHelper_PopulateMusicBeeSongCount"] = (PopulateMusicBeePlaylist?.Songs?.Count ?? 0).ToString(CultureInfo.InvariantCulture),
+                ["SpotifyHelper_PopulateSpotifyPlaylist"] = PopulateSpotifyPlaylist?.Name ?? string.Empty,
+                ["SpotifyHelper_PopulatedSongCount"] = populatedSongs.Count.ToString(CultureInfo.InvariantCulture),
+                ["SpotifyHelper_CheckedPopulatedSongCount"] = populatedSongs.Count(s => s != null && s.Checked).ToString(CultureInfo.InvariantCulture),
+                ["SpotifyHelper_PopulateErrorCount"] = (PopulateErrors?.Count ?? 0).ToString(CultureInfo.InvariantCulture),
+                ["SpotifyHelper_LastRunPlaylistCount"] = (report.Playlists?.Count ?? 0).ToString(CultureInfo.InvariantCulture),
+                ["SpotifyHelper_LastRunAddedSongs"] = report.TotalAddedSongs.ToString(CultureInfo.InvariantCulture),
+                ["SpotifyHelper_LastRunFailedSongs"] = report.TotalFailedSongs.ToString(CultureInfo.InvariantCulture),
+                ["SpotifyHelper_FailureLogPath"] = failureLogPath
+            };
         }
 
         private Dictionary<string, string> LoadLoggedFailures()
@@ -107,7 +151,7 @@ namespace MusicBeePlugin.Services
         {
             if (spotifySong != null)
             {
-                return $"{String.Join("; ", spotifySong.Artists.Select(a => a.Name))} - {spotifySong.Name}";
+                return $"{GetArtistsDisplay(spotifySong?.Artists)} - {spotifySong?.Name ?? "Unknown title"}";
             }
 
             if (mbSong != null)
@@ -145,7 +189,7 @@ namespace MusicBeePlugin.Services
         {
             string redirectUri = SpotifySecrets.REDIRECT_URI;
             string state = Guid.NewGuid().ToString("N");
-            string scopes = "user-library-read playlist-modify-public";
+            string scopes = "user-library-read playlist-modify-public playlist-modify-private user-read-private playlist-read-private playlist-read-collaborative";
 
             string authUrl = $"https://accounts.spotify.com/authorize" +
                              $"?client_id={SpotifySecrets.CLIENT_ID}" +
@@ -196,6 +240,7 @@ namespace MusicBeePlugin.Services
 
                     var tokenResponse = await new OAuthClient(config).RequestToken(tokenRequest);
 
+                    spotifyAccessToken = tokenResponse.AccessToken;
                     Spotify = new SpotifyClient(tokenResponse.AccessToken);
                     Profile = await Spotify.UserProfile.Current();
                     tcs.SetResult(Spotify != null);
@@ -220,15 +265,107 @@ namespace MusicBeePlugin.Services
             return Spotify != null;
         }
 
+        public bool IsPlaylistOwnedByCurrentUser(SimplePlaylist playlist)
+        {
+            if (playlist == null)
+            {
+                return false;
+            }
+
+            string ownerId = playlist.Owner?.Id;
+            return !string.IsNullOrWhiteSpace(ownerId)
+                && !string.IsNullOrWhiteSpace(Profile?.Id)
+                && string.Equals(ownerId, Profile.Id, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public bool CanReadPlaylistItems(SimplePlaylist playlist)
+        {
+            if (playlist == null)
+            {
+                return false;
+            }
+
+            return IsPlaylistOwnedByCurrentUser(playlist) || playlist.Collaborative;
+        }
+
+        public string GetPlaylistOwnerLabel(SimplePlaylist playlist)
+        {
+            if (playlist == null)
+            {
+                return "Unknown owner";
+            }
+
+            string ownerId = playlist.Owner?.Id;
+            string ownerDisplay = playlist.Owner?.DisplayName;
+            if (!string.IsNullOrWhiteSpace(ownerDisplay))
+            {
+                return ownerDisplay;
+            }
+
+            if (!string.IsNullOrWhiteSpace(ownerId))
+            {
+                return ownerId;
+            }
+
+            return "another Spotify account";
+        }
+
+        public string GetPlaylistAccessLabel(SimplePlaylist playlist)
+        {
+            if (playlist == null)
+            {
+                return "unknown";
+            }
+
+            if (IsPlaylistOwnedByCurrentUser(playlist))
+            {
+                return "owned";
+            }
+
+            if (playlist.Collaborative)
+            {
+                return "collaborative";
+            }
+
+            return "followed/read-only";
+        }
+
+        public string GetPlaylistReadRestrictionReason(SimplePlaylist playlist)
+        {
+            if (playlist == null)
+            {
+                return "Spotify playlist was null.";
+            }
+
+            string ownerLabel = GetPlaylistOwnerLabel(playlist);
+            string playlistName = string.IsNullOrWhiteSpace(playlist.Name) ? "Unknown playlist" : playlist.Name;
+
+            if (CanReadPlaylistItems(playlist))
+            {
+                return string.Empty;
+            }
+
+            return $"Spotify only allows reading playlist items for playlists you own or collaborate on. '{playlistName}' appears to be followed/read-only and is owned by {ownerLabel}.";
+        }
+
         public async Task<List<SimplePlaylist>> RefreshPlaylists()
         {
             Playlists.Clear();
-            Paging<SimplePlaylist> response = await Spotify.Playlists.GetUsers(Profile.Id);
+            Paging<SimplePlaylist> response = await Spotify.Playlists.CurrentUsers();
             var all = await Spotify.PaginateAll(response);
             foreach (var item in all)
             {
-                Playlists.Add(item);
+                if (item != null)
+                {
+                    Playlists.Add(item);
+                }
             }
+
+            int ownedCount = Playlists.Count(IsPlaylistOwnedByCurrentUser);
+            int collaborativeCount = Playlists.Count(p => p != null && !IsPlaylistOwnedByCurrentUser(p) && p.Collaborative);
+            int followedCount = Playlists.Count - ownedCount - collaborativeCount;
+            Log($"Spotify account: {(string.IsNullOrWhiteSpace(Profile?.DisplayName) ? Profile?.Id ?? "Unknown user" : Profile.DisplayName + " (" + Profile.Id + ")")}");
+            Log($"Spotify playlists loaded: {Playlists.Count} total | {ownedCount} owned | {collaborativeCount} collaborative | {followedCount} followed/read-only.");
 
             return Playlists;
         }
@@ -241,10 +378,30 @@ namespace MusicBeePlugin.Services
 
             foreach (MusicBeePlaylist playlist in mbPlaylistsToSync)
             {
-                PopulateMusicBeePlaylist = playlist;
-                await PopulateSpotifyPlaylistSongsFromMbPlaylist(false);
+                try
+                {
+                    PopulateMusicBeePlaylist = playlist;
+                    await PopulateSpotifyPlaylistSongsFromMbPlaylist(false);
 
-                await SaveSpotifyPlaylistPopulatedFromMbPlaylist(settings);
+                    await SaveSpotifyPlaylistPopulatedFromMbPlaylist(settings);
+                }
+                catch (Exception ex)
+                {
+                    string playlistName = playlist?.Name ?? "Unknown MusicBee playlist";
+                    Log($"Failed to sync MusicBee playlist '{playlistName}' to Spotify: {ex.Message}");
+                    LastRunReport.Playlists.Add(new PlaylistSyncResult
+                    {
+                        PlaylistName = playlistName,
+                        FailedSongs = new List<SyncFailureDetail>
+                        {
+                            new SyncFailureDetail
+                            {
+                                Signature = $"SPSYNC::{playlistName}",
+                                Description = $"{playlistName}: playlist sync failed - {ex.Message}"
+                            }
+                        }
+                    });
+                }
             }
         }
 
@@ -256,10 +413,30 @@ namespace MusicBeePlugin.Services
             // Go through each playlist we want to sync in turn
             foreach (SimplePlaylist playlist in playlists)
             {
-                PopulateSpotifyPlaylist = playlist;
-                await PopulateMbPlaylistSongsFromSpotifyPlaylist(false);
+                try
+                {
+                    PopulateSpotifyPlaylist = playlist;
+                    await PopulateMbPlaylistSongsFromSpotifyPlaylist(false);
 
-                await SaveMbPlaylistPopulatedFromSpotifyPlaylist();
+                    await SaveMbPlaylistPopulatedFromSpotifyPlaylist();
+                }
+                catch (Exception ex)
+                {
+                    string playlistName = playlist?.Name ?? "Unknown Spotify playlist";
+                    Log($"Failed to sync Spotify playlist '{playlistName}' to MusicBee: {ex.Message}");
+                    LastRunReport.Playlists.Add(new PlaylistSyncResult
+                    {
+                        PlaylistName = playlistName,
+                        FailedSongs = new List<SyncFailureDetail>
+                        {
+                            new SyncFailureDetail
+                            {
+                                Signature = $"MBSYNC::{playlist?.Id ?? playlistName}",
+                                Description = $"{playlistName}: playlist sync failed - {ex.Message}"
+                            }
+                        }
+                    });
+                }
             }
 
             // Get the local playlists again
@@ -268,21 +445,325 @@ namespace MusicBeePlugin.Services
 
         private async Task<List<FullTrack>> GetFullTracksFromSpotifyPlaylist(SimplePlaylist playlist)
         {
-            var tracks = new List<FullTrack>();
-
-            // Get all tracks for playlist
-            var fp = await Spotify.Playlists.Get(playlist.Id);
-            var allTracks = await Spotify.PaginateAll(fp.Tracks);
-            
-            foreach (var t in allTracks)
+            if (playlist == null)
             {
-                if (t.Track is FullTrack track)
+                throw new ArgumentNullException(nameof(playlist));
+            }
+
+            if (string.IsNullOrWhiteSpace(playlist.Id))
+            {
+                throw new InvalidOperationException($"Spotify playlist '{playlist.Name ?? "Unknown playlist"}' has no valid playlist id.");
+            }
+
+            if (!CanReadPlaylistItems(playlist))
+            {
+                throw new InvalidOperationException(GetPlaylistReadRestrictionReason(playlist));
+            }
+
+            var result = await ReadPlaylistTracksWithFallbacks(playlist);
+            if (result.Tracks.Count > 0)
+            {
+                if (result.IsPartial)
                 {
-                    tracks.Add(track);
+                    Log($"Spotify only returned the first {result.Tracks.Count} of {result.Total ?? result.Tracks.Count} items for '{playlist.Name ?? "Unknown playlist"}'. Sync will continue with the readable subset.");
+                }
+
+                return result.Tracks;
+            }
+
+            string ownerLabel = GetPlaylistOwnerLabel(playlist);
+            string accessLabel = GetPlaylistAccessLabel(playlist);
+            string playlistName = playlist.Name ?? "Unknown playlist";
+
+            if (result.ItemsEndpointForbidden && (IsPlaylistOwnedByCurrentUser(playlist) || playlist.Collaborative))
+            {
+                throw new InvalidOperationException(
+                    $"Spotify forbids this app from reading playlist contents for '{playlistName}' even though it is marked {accessLabel}. " +
+                    $"This usually means the signed-in Spotify account is not allowed to use this Development Mode app, the app owner's Premium requirement is not satisfied, or Spotify has restricted playlist-content access for this client ID.");
+            }
+
+            if (!string.IsNullOrWhiteSpace(result.FailureReason))
+            {
+                throw new InvalidOperationException(result.FailureReason);
+            }
+
+            throw new InvalidOperationException(
+                $"Spotify did not return readable playlist items for '{playlistName}'. Owner: {ownerLabel}. Access: {accessLabel}.");
+        }
+
+        private async Task<PlaylistReadResult> ReadPlaylistTracksWithFallbacks(SimplePlaylist playlist)
+        {
+            var result = new PlaylistReadResult();
+
+            var detailsResult = await GetPlaylistTracksFromPlaylistDetailsEndpoint(playlist);
+            MergeTracks(result.Tracks, detailsResult.Tracks);
+            result.Total = detailsResult.Total;
+            result.UsedPlaylistDetailsEndpoint = detailsResult.UsedPlaylistDetailsEndpoint;
+            result.DetailsHadEmbeddedItems = detailsResult.DetailsHadEmbeddedItems;
+            result.DetailsEndpointForbidden = detailsResult.DetailsEndpointForbidden;
+            if (string.IsNullOrWhiteSpace(result.FailureReason))
+            {
+                result.FailureReason = detailsResult.FailureReason;
+            }
+
+            int currentCount = result.Tracks.Count;
+            bool needsMore = result.Total.HasValue && currentCount > 0 && currentCount < result.Total.Value;
+
+            if (!result.DetailsHadEmbeddedItems || needsMore)
+            {
+                var itemsResult = await GetPlaylistTracksFromItemsEndpoint(playlist, currentCount);
+                MergeTracks(result.Tracks, itemsResult.Tracks);
+                result.UsedPlaylistItemsEndpoint = itemsResult.UsedPlaylistItemsEndpoint;
+                result.ItemsEndpointForbidden = itemsResult.ItemsEndpointForbidden;
+                if (!result.Total.HasValue)
+                {
+                    result.Total = itemsResult.Total;
+                }
+
+                if (string.IsNullOrWhiteSpace(result.FailureReason))
+                {
+                    result.FailureReason = itemsResult.FailureReason;
                 }
             }
 
-            return tracks;
+            if (result.Total.HasValue && result.Tracks.Count > 0 && result.Tracks.Count < result.Total.Value)
+            {
+                result.IsPartial = true;
+            }
+
+            return result;
+        }
+
+        private async Task<PlaylistReadResult> GetPlaylistTracksFromPlaylistDetailsEndpoint(SimplePlaylist playlist)
+        {
+            var result = new PlaylistReadResult();
+
+            if (string.IsNullOrWhiteSpace(spotifyAccessToken))
+            {
+                result.FailureReason = $"Spotify access token was not available while reading playlist '{playlist.Name ?? "Unknown playlist"}'.";
+                return result;
+            }
+
+            string requestUri = $"https://api.spotify.com/v1/playlists/{Uri.EscapeDataString(playlist.Id)}?additional_types=track";
+            using (var client = new HttpClient())
+            {
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", spotifyAccessToken);
+                HttpResponseMessage response = null;
+
+                try
+                {
+                    response = await client.GetAsync(requestUri);
+                }
+                catch (Exception ex)
+                {
+                    result.FailureReason = $"Spotify playlist detail request failed for '{playlist.Name ?? "Unknown playlist"}': {ex.Message}";
+                    Log(result.FailureReason);
+                    return result;
+                }
+
+                string body = await response.Content.ReadAsStringAsync();
+                if (response.StatusCode == HttpStatusCode.Forbidden)
+                {
+                    result.DetailsEndpointForbidden = true;
+                    result.FailureReason = $"Spotify playlist detail request returned 403 Forbidden for '{playlist.Name ?? "Unknown playlist"}'.";
+                    Log($"{result.FailureReason} Response: {body}");
+                    return result;
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    result.FailureReason = $"Spotify playlist detail request returned {(int)response.StatusCode} {response.ReasonPhrase} for '{playlist.Name ?? "Unknown playlist"}'.";
+                    Log($"{result.FailureReason} Response: {body}");
+                    return result;
+                }
+
+                result.UsedPlaylistDetailsEndpoint = true;
+
+                JObject parsed;
+                try
+                {
+                    parsed = JObject.Parse(body);
+                }
+                catch (Exception ex)
+                {
+                    result.FailureReason = $"Could not parse Spotify playlist detail response for '{playlist.Name ?? "Unknown playlist"}': {ex.Message}";
+                    Log(result.FailureReason);
+                    return result;
+                }
+
+                var itemsObject = parsed["items"] as JObject;
+                if (itemsObject == null)
+                {
+                    var legacyTracksObject = parsed["tracks"] as JObject;
+                    itemsObject = legacyTracksObject;
+                }
+
+                if (itemsObject == null)
+                {
+                    result.FailureReason = $"Spotify playlist detail response for '{playlist.Name ?? "Unknown playlist"}' did not include embedded items.";
+                    Log(result.FailureReason);
+                    return result;
+                }
+
+                result.DetailsHadEmbeddedItems = true;
+                result.Total = itemsObject.Value<int?>("total");
+                ExtractTracksFromPagingItems(itemsObject["items"] as JArray, result.Tracks, playlist);
+                return result;
+            }
+        }
+
+        private async Task<PlaylistReadResult> GetPlaylistTracksFromItemsEndpoint(SimplePlaylist playlist, int initialOffset)
+        {
+            var result = new PlaylistReadResult();
+
+            if (string.IsNullOrWhiteSpace(spotifyAccessToken))
+            {
+                result.FailureReason = $"Spotify access token was not available while reading playlist '{playlist.Name ?? "Unknown playlist"}'.";
+                return result;
+            }
+
+            using (var client = new HttpClient())
+            {
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", spotifyAccessToken);
+
+                int offset = Math.Max(0, initialOffset);
+                const int limit = 100;
+
+                while (true)
+                {
+                    string requestUri = $"https://api.spotify.com/v1/playlists/{Uri.EscapeDataString(playlist.Id)}/items?limit={limit}&offset={offset}&additional_types=track";
+                    HttpResponseMessage response = null;
+
+                    try
+                    {
+                        response = await client.GetAsync(requestUri);
+                    }
+                    catch (Exception ex)
+                    {
+                        result.FailureReason = $"Spotify playlist item request failed for '{playlist.Name ?? "Unknown playlist"}' at offset {offset}: {ex.Message}";
+                        Log(result.FailureReason);
+                        return result;
+                    }
+
+                    string body = await response.Content.ReadAsStringAsync();
+                    if (response.StatusCode == HttpStatusCode.Forbidden)
+                    {
+                        result.ItemsEndpointForbidden = true;
+                        result.FailureReason = $"Spotify playlist item request returned 403 Forbidden for '{playlist.Name ?? "Unknown playlist"}' at offset {offset}.";
+                        Log($"{result.FailureReason} Response: {body}");
+                        return result;
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        result.FailureReason = $"Spotify playlist item request returned {(int)response.StatusCode} {response.ReasonPhrase} for '{playlist.Name ?? "Unknown playlist"}' at offset {offset}.";
+                        Log($"{result.FailureReason} Response: {body}");
+                        return result;
+                    }
+
+                    result.UsedPlaylistItemsEndpoint = true;
+
+                    JObject parsed;
+                    try
+                    {
+                        parsed = JObject.Parse(body);
+                    }
+                    catch (Exception ex)
+                    {
+                        result.FailureReason = $"Could not parse Spotify playlist item response for '{playlist.Name ?? "Unknown playlist"}' at offset {offset}: {ex.Message}";
+                        Log(result.FailureReason);
+                        return result;
+                    }
+
+                    if (!result.Total.HasValue)
+                    {
+                        result.Total = parsed.Value<int?>("total");
+                    }
+
+                    var items = parsed["items"] as JArray;
+                    if (items == null || items.Count == 0)
+                    {
+                        return result;
+                    }
+
+                    int beforeCount = result.Tracks.Count;
+                    ExtractTracksFromPagingItems(items, result.Tracks, playlist);
+
+                    int? total = parsed.Value<int?>("total");
+                    string next = parsed.Value<string>("next");
+                    offset += Math.Max(1, items.Count);
+
+                    if (string.IsNullOrWhiteSpace(next) && (!total.HasValue || offset >= total.Value))
+                    {
+                        return result;
+                    }
+
+                    if (result.Tracks.Count == beforeCount)
+                    {
+                        result.FailureReason = $"Spotify returned playlist items for '{playlist.Name ?? "Unknown playlist"}' but none could be deserialized at offset {offset}.";
+                        Log(result.FailureReason);
+                        return result;
+                    }
+                }
+            }
+        }
+
+        private void ExtractTracksFromPagingItems(JArray items, List<FullTrack> destination, SimplePlaylist playlist)
+        {
+            if (items == null || destination == null)
+            {
+                return;
+            }
+
+            foreach (var item in items)
+            {
+                var trackToken = item?["item"] ?? item?["track"] ?? item;
+                if (trackToken == null || trackToken.Type == JTokenType.Null)
+                {
+                    continue;
+                }
+
+                string type = trackToken.Value<string>("type");
+                if (!string.IsNullOrWhiteSpace(type) && !string.Equals(type, "track", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var track = trackToken.ToObject<FullTrack>();
+                    if (track != null && !string.IsNullOrWhiteSpace(track.Id))
+                    {
+                        destination.Add(track);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Could not deserialize track for '{playlist?.Name ?? "Unknown playlist"}': {ex.Message}");
+                }
+            }
+        }
+
+        private void MergeTracks(List<FullTrack> destination, IEnumerable<FullTrack> incoming)
+        {
+            if (destination == null || incoming == null)
+            {
+                return;
+            }
+
+            var seen = new HashSet<string>(destination.Where(t => !string.IsNullOrWhiteSpace(t?.Id)).Select(t => t.Id), StringComparer.OrdinalIgnoreCase);
+            foreach (var track in incoming)
+            {
+                if (track == null || string.IsNullOrWhiteSpace(track.Id))
+                {
+                    continue;
+                }
+
+                if (seen.Add(track.Id))
+                {
+                    destination.Add(track);
+                }
+            }
         }
 
         private MusicBeeSong FindMusicBeeSongFromSpotifyTrack(FullTrack track)
@@ -345,10 +826,10 @@ namespace MusicBeePlugin.Services
                 {
                     PopulateErrors.Add(new UnableToFindSpotifyTrackError()
                     {
-                        AlbumName = song.SpotifySong.Album.Name,
-                        ArtistName = song.SpotifySong.Artists.FirstOrDefault().Name,
+                        AlbumName = song.SpotifySong?.Album?.Name ?? string.Empty,
+                        ArtistName = GetPrimaryArtistName(song.SpotifySong?.Artists),
                         PlaylistName = PopulateSpotifyPlaylist.Name,
-                        TrackName = song.SpotifySong.Name,
+                        TrackName = song.SpotifySong?.Name ?? "Unknown title",
                         SearchedService = false
                     });
                 }
@@ -459,55 +940,87 @@ namespace MusicBeePlugin.Services
 
             foreach (var song in PopulatedSongs)
             {
-                string title = song.MbSong.Title;
-                string artist = song.MbSong.Artist;
-                string album = song.MbSong.Album;
+                string title = song.MbSong?.Title?.Trim();
+                string artist = song.MbSong?.Artist?.Trim();
+                string album = song.MbSong?.Album?.Trim() ?? string.Empty;
 
-                string artistEsc = EscapeChar(artist.ToLower());
-                string titleEsc = EscapeChar(title.ToLower());
-                string searchStr = $"artist:{artistEsc} track:{titleEsc}";
-                var request = new SearchRequest(SearchRequest.Types.Track, searchStr);
-                SearchResponse search = await Spotify.Search.Item(request);
-
-                if (search.Tracks == null || search.Tracks.Items == null)
+                if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(artist))
                 {
-                    Log($"Could not find track on Spotify '{searchStr}' for '{title}' by '{artist}'");
-                    continue;
-                }
-
-                if (search.Tracks.Items.Count == 0)
-                {
-                    Log($"Found 0 results on Spotify for: {searchStr} for '{title}' by '{artist}'");
-                    continue;
-                }
-
-                FullTrack trackToAdd = null;
-                int bestScore = int.MinValue;
-                foreach (FullTrack track in search.Tracks.Items)
-                {
-                    int score = GetSongMatchScore(track, song.MbSong);
-                    if (score > bestScore)
+                    Log($"Skipping MusicBee track with missing metadata: '{song.MbSong?.Filename ?? "Unknown file"}'. Title='{title ?? string.Empty}', Artist='{artist ?? string.Empty}'.");
+                    PopulateErrors.Add(new UnableToFindSpotifyTrackError()
                     {
-                        bestScore = score;
-                        trackToAdd = track;
-                    }
-                }
-
-                if (trackToAdd == null || bestScore < 10)
-                {
-                    Log($"No confident match found for '{title}' by '{artist}' on Spotify.");
+                        AlbumName = album,
+                        ArtistName = artist ?? "[missing artist]",
+                        PlaylistName = PopulateMusicBeePlaylist.Name,
+                        TrackName = title ?? "[missing title]",
+                        SearchedService = true
+                    });
                     song.SpotifySong = null;
                     song.Checked = false;
                     continue;
                 }
 
-                if (bestScore < 16)
-                {
-                    Log($"Using closest Spotify match for '{title}' by '{artist}': '{trackToAdd?.Name}' by '{trackToAdd?.Artists.FirstOrDefault()?.Name}' (score {bestScore})");
-                }
+                string artistEsc = EscapeChar(artist.ToLowerInvariant());
+                string titleEsc = EscapeChar(title.ToLowerInvariant());
+                string searchStr = $"artist:{artistEsc} track:{titleEsc}";
 
-                song.SpotifySong = trackToAdd;
-                song.Checked = true;
+                try
+                {
+                    var request = new SearchRequest(SearchRequest.Types.Track, searchStr);
+                    SearchResponse search = await Spotify.Search.Item(request);
+
+                    if (search.Tracks == null || search.Tracks.Items == null)
+                    {
+                        Log($"Could not find track on Spotify '{searchStr}' for '{title}' by '{artist}'");
+                        continue;
+                    }
+
+                    if (search.Tracks.Items.Count == 0)
+                    {
+                        Log($"Found 0 results on Spotify for: {searchStr} for '{title}' by '{artist}'");
+                        continue;
+                    }
+
+                    FullTrack trackToAdd = null;
+                    int bestScore = int.MinValue;
+                    foreach (FullTrack track in search.Tracks.Items)
+                    {
+                        int score = GetSongMatchScore(track, song.MbSong);
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            trackToAdd = track;
+                        }
+                    }
+
+                    if (trackToAdd == null || bestScore < 10)
+                    {
+                        Log($"No confident match found for '{title}' by '{artist}' on Spotify.");
+                        song.SpotifySong = null;
+                        song.Checked = false;
+                        continue;
+                    }
+
+                    if (bestScore < 16)
+                    {
+                        Log($"Using closest Spotify match for '{title}' by '{artist}': '{trackToAdd?.Name}' by '{GetPrimaryArtistName(trackToAdd?.Artists)}' (score {bestScore})");
+                    }
+
+                    song.SpotifySong = trackToAdd;
+                    song.Checked = true;
+                }
+                catch (APIException ex)
+                {
+                    Log($"Spotify search failed for '{title}' by '{artist}': {ex.Message}");
+                    song.SpotifySong = null;
+                    song.Checked = false;
+                }
+                catch (Exception ex)
+                {
+                    Log($"Unexpected error while searching Spotify for '{title}' by '{artist}': {ex.Message}");
+                    song.SpotifySong = null;
+                    song.Checked = false;
+                }
             }
         }
 
@@ -541,7 +1054,7 @@ namespace MusicBeePlugin.Services
                 PlaylistName = spotifyPlaylistName
             };
 
-            SimplePlaylist thisPlaylist = Playlists.FirstOrDefault(p => p.Name == spotifyPlaylistName);
+            SimplePlaylist thisPlaylist = Playlists.FirstOrDefault(p => string.Equals(p?.Name, spotifyPlaylistName, StringComparison.OrdinalIgnoreCase));
             string thisPlaylistId;
 
             if (thisPlaylist != null)
@@ -708,6 +1221,34 @@ namespace MusicBeePlugin.Services
             }
         }
 
+        private string GetArtistsDisplay(IEnumerable<SimpleArtist> artists)
+        {
+            if (artists == null)
+            {
+                return "Unknown artist";
+            }
+
+            var names = artists
+                .Where(a => !string.IsNullOrWhiteSpace(a?.Name))
+                .Select(a => a.Name)
+                .ToList();
+
+            return names.Count > 0 ? string.Join("; ", names) : "Unknown artist";
+        }
+
+        private string GetPrimaryArtistName(IEnumerable<SimpleArtist> artists)
+        {
+            if (artists == null)
+            {
+                return "Unknown artist";
+            }
+
+            return artists
+                .Select(a => a?.Name)
+                .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name))
+                ?? "Unknown artist";
+        }
+
         private int GetSongMatchScore(FullTrack track, MusicBeeSong mbSong)
         {
             if (track == null || mbSong == null)
@@ -860,8 +1401,11 @@ namespace MusicBeePlugin.Services
 
         public async Task<IEnumerable<FullTrack>> FindSongsInSpotifyDatabase(string artist, string title)
         {
-            string artistEsc = EscapeChar(artist.ToLower());
-            string titleEsc = EscapeChar(title.ToLower());
+            if (string.IsNullOrWhiteSpace(artist) || string.IsNullOrWhiteSpace(title))
+                return new List<FullTrack>(0);
+
+            string artistEsc = EscapeChar(artist.ToLowerInvariant());
+            string titleEsc = EscapeChar(title.ToLowerInvariant());
             string searchStr = $"artist:{artistEsc} track:{titleEsc}";
             var request = new SearchRequest(SearchRequest.Types.Track, searchStr);
             

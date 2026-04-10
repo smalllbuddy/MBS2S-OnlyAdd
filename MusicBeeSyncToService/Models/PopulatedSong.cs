@@ -41,7 +41,11 @@ namespace MusicBeePlugin.Models
             {
                 if (SpotifySong == null)
                     return "";
-                return String.Join("; ", SpotifySong.Artists.Select(a => a.Name)) + " - " + SpotifySong.Name;
+                var artistNames = SpotifySong.Artists == null
+                    ? string.Empty
+                    : String.Join("; ", SpotifySong.Artists.Where(a => !string.IsNullOrWhiteSpace(a?.Name)).Select(a => a.Name));
+
+                return (string.IsNullOrWhiteSpace(artistNames) ? "Unknown artist" : artistNames) + " - " + (SpotifySong.Name ?? "Unknown title");
             }
         }
     }

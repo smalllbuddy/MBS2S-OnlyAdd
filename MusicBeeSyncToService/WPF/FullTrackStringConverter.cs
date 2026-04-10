@@ -17,7 +17,11 @@ namespace MusicBeePlugin.WPF
             if (FullTrack == null)
                 return "";
 
-            return String.Join("; ", FullTrack.Artists.Select(a => a.Name)) + " - " + FullTrack.Name;         
+            var artistNames = FullTrack.Artists == null
+                ? string.Empty
+                : String.Join("; ", FullTrack.Artists.Where(a => !string.IsNullOrWhiteSpace(a?.Name)).Select(a => a.Name));
+
+            return (string.IsNullOrWhiteSpace(artistNames) ? "Unknown artist" : artistNames) + " - " + (FullTrack.Name ?? "Unknown title");         
         }
 
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
